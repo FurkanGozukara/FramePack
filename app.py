@@ -3015,7 +3015,7 @@ def get_nearest_bucket_size (width :int ,height :int ,resolution :str )->tuple [
 css =make_progress_bar_css ()
 block =gr .Blocks (css =css ).queue ()
 with block :
-    gr .Markdown ('# FramePack Improved SECourses App V57 - https://www.patreon.com/posts/126855226')
+    gr .Markdown ('# FramePack Improved SECourses App V58 - https://www.patreon.com/posts/126855226')
     with gr .Row ():
 
         model_selector =gr .Radio (
@@ -3127,7 +3127,7 @@ with block :
                 n_prompt =gr .Textbox (label ="Negative Prompt",value ="",visible =True ,info ="Used when CFG Scale > 1.0 (Primarily for Original Model)")
 
                 with gr .Row ():
-                    fps =gr .Slider (label ="FPS",minimum =10 ,maximum =60 ,value =30 ,step =1 ,info ="Output Videos FPS - Directly changes how many frames are generated")
+                    fps =gr .Slider (label ="FPS",minimum =4 ,maximum =60 ,value =30 ,step =1 ,info ="Output Videos FPS - Directly changes how many frames are generated")
                     total_second_length =gr .Slider (label ="Total Video Length (Seconds)",minimum =1 ,maximum =120 ,value =5 ,step =0.1 )
 
                 with gr .Row ():
