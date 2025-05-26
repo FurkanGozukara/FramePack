@@ -1,9 +1,10 @@
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Dict, List, Optional, Union
 from diffusers.loaders.lora_pipeline import _fetch_state_dict
 from diffusers.loaders.lora_conversion_utils import _convert_hunyuan_video_lora_to_diffusers
 from diffusers.utils.peft_utils import set_weights_and_activate_adapters
 from diffusers.loaders.peft import _SET_ADAPTER_SCALE_FN_MAPPING
+import torch
 
 def load_lora(transformer, lora_path: Path, weight_name: Optional[str] = "pytorch_lora_weights.safetensors"):
     """
@@ -17,25 +18,117 @@ def load_lora(transformer, lora_path: Path, weight_name: Optional[str] = "pytorc
     """
     
     state_dict = _fetch_state_dict(
-    lora_path,
-    weight_name,
-    True,
-    True,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    None)
-
+        lora_path,
+        weight_name,
+        True,
+        True,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None)
 
     state_dict = _convert_hunyuan_video_lora_to_diffusers(state_dict)
     
-    transformer.load_lora_adapter(state_dict, network_alphas=None, adapter_name=weight_name.split(".")[0])
-    print("LoRA weights loaded successfully.")
+    # Fix adapter name handling to avoid PyTorch module naming issues
+    # The module name in the state_dict must not include a . in the name
+    # See https://github.com/pytorch/pytorch/pull/6639/files#diff-4be56271f7bfe650e3521c81fd363da58f109cd23ee80d243156d2d6ccda6263R133-R134
+    adapter_name = str(PurePath(weight_name).with_suffix('')).replace('.', '_DOT_')
+    if '_DOT_' in adapter_name:
+        print(
+            f"LoRA file '{weight_name}' contains a '.' in the name. " +
+            'This may cause issues. Consider renaming the file.' +
+            f" Using '{adapter_name}' as the adapter name to be safe."
+        )
+    
+    # Check if adapter already exists and delete it if it does
+    if hasattr(transformer, 'peft_config') and adapter_name in transformer.peft_config:
+        print(f"Adapter '{adapter_name}' already exists. Removing it before loading again.")
+        # Use delete_adapters (plural) instead of delete_adapter
+        transformer.delete_adapters([adapter_name])
+    
+    # Load the adapter with the proper name
+    transformer.load_lora_adapter(state_dict, network_alphas=None, adapter_name=adapter_name)
+    print(f"LoRA weights '{adapter_name}' loaded successfully.")
     return transformer
+
+def unload_all_loras(transformer):
+    """
+    Completely unload all LoRA adapters from the transformer model.
+    """
+    if hasattr(transformer, 'peft_config') and transformer.peft_config:
+        # Get all adapter names
+        adapter_names = list(transformer.peft_config.keys())
+        
+        if adapter_names:
+            print(f"Removing all LoRA adapters: {', '.join(adapter_names)}")
+            # Delete all adapters
+            transformer.delete_adapters(adapter_names)
+            
+            # Force cleanup of any remaining adapter references
+            if hasattr(transformer, 'active_adapter'):
+                transformer.active_adapter = None
+                
+            # Clear any cached states
+            for module in transformer.modules():
+                if hasattr(module, 'lora_A'):
+                    if isinstance(module.lora_A, dict):
+                        module.lora_A.clear()
+                if hasattr(module, 'lora_B'):
+                    if isinstance(module.lora_B, dict):
+                        module.lora_B.clear()
+                if hasattr(module, 'scaling'):
+                    if isinstance(module.scaling, dict):
+                        module.scaling.clear()
+            
+            print("All LoRA adapters have been completely removed.")
+        else:
+            print("No LoRA adapters found to remove.")
+    else:
+        print("Model doesn't have any LoRA adapters or peft_config.")
+    
+    # Force garbage collection
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return transformer
+
+def apply_lora_scaling(transformer, adapter_name: str, lora_strength: float):
+    """
+    Apply LoRA scaling/strength to a specific adapter.
+    
+    Args:
+        transformer: The transformer model with loaded LoRA adapters
+        adapter_name: Name of the adapter to apply scaling to
+        lora_strength: Strength/scale value to apply
+    """
+    print(f"Setting LoRA '{adapter_name}' strength to {lora_strength}")
+    
+    # Set scaling for this LoRA by iterating through modules
+    for name, module in transformer.named_modules():
+        if hasattr(module, 'scaling'):
+            if isinstance(module.scaling, dict):
+                # Handle ModuleDict case (PEFT implementation)
+                if adapter_name in module.scaling:
+                    if isinstance(module.scaling[adapter_name], torch.Tensor):
+                        module.scaling[adapter_name] = torch.tensor(
+                            lora_strength, device=module.scaling[adapter_name].device
+                        )
+                    else:
+                        module.scaling[adapter_name] = lora_strength
+            else:
+                # Handle direct attribute case for scaling if needed
+                if isinstance(module.scaling, torch.Tensor):
+                    module.scaling = torch.tensor(
+                        lora_strength, device=module.scaling.device
+                    )
+                else:
+                    module.scaling = lora_strength
     
 # TODO(neph1): remove when HunyuanVideoTransformer3DModelPacked is in _SET_ADAPTER_SCALE_FN_MAPPING
 def set_adapters(

@@ -37,7 +37,8 @@ from diffusers_helper .thread_utils import AsyncStream ,async_run
 from diffusers_helper .gradio .progress_bar import make_progress_bar_css ,make_progress_bar_html 
 from transformers import SiglipImageProcessor ,SiglipVisionModel 
 from diffusers_helper .clip_vision import hf_clip_vision_encode 
-from diffusers_helper .load_lora import load_lora ,set_adapters 
+from diffusers_helper .load_lora import load_lora ,set_adapters, unload_all_loras, apply_lora_scaling
+from pathlib import PurePath 
 from diffusers_helper .bucket_tools import find_nearest_bucket 
 from PIL import ImageOps
 
@@ -367,34 +368,13 @@ def safe_unload_lora (model ,device =None ):
     is_dynamic_swap ='DynamicSwap'in model .__class__ .__name__ 
 
     try :
+        # First try the new unload_all_loras function
+        if hasattr(model, 'peft_config') and model.peft_config:
+            print("Using new unload_all_loras method")
+            unload_all_loras(model)
+            return True
 
-        if hasattr (model ,"unload_lora_weights"):
-            print ("Unloading LoRA using unload_lora_weights method")
-            model .unload_lora_weights ()
-
-            if hasattr (model ,"disable_adapters"):
-                model .disable_adapters ()
-                print ("Additionally called disable_adapters.")
-            if hasattr (model ,"peft_config"):
-                model .peft_config ={}
-                print ("Cleared peft_config.")
-            return True 
-
-        elif hasattr (model ,"peft_config")and model .peft_config :
-            if hasattr (model ,"disable_adapters"):
-                print ("Unloading LoRA using disable_adapters method")
-                model .disable_adapters ()
-                model .peft_config ={}
-                print ("Cleared peft_config.")
-                return True 
-
-            elif hasattr (model ,"active_adapters")and model .active_adapters :
-                print ("Clearing active adapters list")
-                model .active_adapters =[]
-                model .peft_config ={}
-                print ("Cleared peft_config.")
-                return True 
-
+        # Handle DynamicSwap models
         elif is_dynamic_swap :
             print ("DynamicSwap model detected, attempting to reset internal model state")
 
@@ -404,6 +384,18 @@ def safe_unload_lora (model ,device =None ):
 
             print (f"Attempting unload on model type: {type(internal_model).__name__}")
 
+            # Try new method on internal model
+            if hasattr(internal_model, 'peft_config') and internal_model.peft_config:
+                print("Using new unload_all_loras method on internal model")
+                unload_all_loras(internal_model)
+                
+                # Clear wrapper state
+                if hasattr (model ,"peft_config"):model .peft_config ={}
+                if hasattr (model ,"active_adapters"):model .active_adapters =[]
+                print ("Cleared LoRA state on DynamicSwap wrapper.")
+                return True
+
+            # Fallback to old method for DynamicSwap
             unloaded_internal =False 
             if hasattr (internal_model ,"unload_lora_weights"):
                 print ("Unloading LoRA from internal model using unload_lora_weights")
@@ -420,7 +412,6 @@ def safe_unload_lora (model ,device =None ):
                 unloaded_internal =True 
 
             if unloaded_internal :
-
                 if hasattr (model ,"peft_config"):model .peft_config ={}
                 if hasattr (model ,"active_adapters"):model .active_adapters =[]
                 print ("Cleared LoRA state on DynamicSwap wrapper.")
@@ -428,6 +419,20 @@ def safe_unload_lora (model ,device =None ):
 
             print ("Attempting direct LoRA module removal as fallback")
             return force_remove_lora_modules (model )
+
+        # Fallback to old methods
+        elif hasattr (model ,"unload_lora_weights"):
+            print ("Unloading LoRA using unload_lora_weights method")
+            model .unload_lora_weights ()
+
+            if hasattr (model ,"disable_adapters"):
+                model .disable_adapters ()
+                print ("Additionally called disable_adapters.")
+            if hasattr (model ,"peft_config"):
+                model .peft_config ={}
+                print ("Cleared peft_config.")
+            return True 
+
         else :
             print ("No LoRA adapter found to unload")
             return True 
@@ -996,53 +1001,44 @@ save_temp_metadata_ui_value: bool = True # New parameter
     if lora_scales is None:
         lora_scales = [1.0] * N_LORA
 
-    # Prepare unique adapter names and scales for set_adapters
-    peft_adapters_to_activate = []  # list of (adapter_name, scale)
-    activated_peft_names_in_this_call = set()
+    # Apply LoRA scaling directly to loaded adapters
+    active_loras = []
     for i in range(N_LORA):
-        peft_adapter_name_for_slot = currently_loaded_lora_info[i]["adapter_name"]
-        scale_for_slot = lora_scales[i]
-        if peft_adapter_name_for_slot is not None and peft_adapter_name_for_slot not in activated_peft_names_in_this_call:
-            peft_adapters_to_activate.append((peft_adapter_name_for_slot, scale_for_slot))
-            activated_peft_names_in_this_call.add(peft_adapter_name_for_slot)
+        adapter_name = currently_loaded_lora_info[i]["adapter_name"]
+        scale = lora_scales[i]
+        if adapter_name is not None:
+            active_loras.append((adapter_name, scale))
 
-    # IMPORTANT: First ensure all LoRA parameters are on the same device (GPU)
-    # This must be done before set_adapters to avoid device mismatch errors
-    if peft_adapters_to_activate:
-        adapter_names_for_set_adapters = [item[0] for item in peft_adapters_to_activate]
-        weights_for_set_adapters = [item[1] for item in peft_adapters_to_activate]
+    if active_loras:
+        print(f"Worker: Applying LoRA scaling for {len(active_loras)} adapters...")
         
-        # First, ensure ALL LoRA-related parameters are on GPU
-        print(f"Worker: Moving ALL LoRA parameters to {gpu} before activation...")
-        lora_params_synced_count = 0
-        try:
-            for param_name, param in transformer.named_parameters():
-                if 'lora_' in param_name:  # Any LoRA parameter
-                    if param.device != gpu:
-                        param.data = param.data.to(gpu)
-                        lora_params_synced_count += 1
-            if lora_params_synced_count > 0:
-                print(f"Worker: Synced {lora_params_synced_count} LoRA parameters to {gpu}.")
-            else:
-                print(f"Worker: All LoRA parameters appear to be already on {gpu}.")
-        except Exception as sync_err:
-            print(f"Worker ERROR: Failed to sync LoRA parameters to {gpu}: {sync_err}")
-            traceback.print_exc()
+        # Apply scaling to each unique adapter
+        applied_adapters = set()
+        for adapter_name, scale in active_loras:
+            if adapter_name not in applied_adapters:
+                try:
+                    apply_lora_scaling(transformer, adapter_name, scale)
+                    applied_adapters.add(adapter_name)
+                    print(f"Worker: Applied scaling {scale} to adapter '{adapter_name}'")
+                except Exception as e:
+                    print(f"Worker ERROR applying scaling to adapter '{adapter_name}': {e}")
+                    traceback.print_exc()
         
-        # Now apply adapters
-        try:
-            set_adapters(transformer, adapter_names_for_set_adapters, weights_for_set_adapters)
-            print(f"Worker: Applied LoRA adapters {adapter_names_for_set_adapters} with scales {weights_for_set_adapters}")
-        except Exception as e:
-            print(f"Worker ERROR applying LoRA adapters: {e}")
-            traceback.print_exc()
-    
-    elif hasattr(transformer, 'disable_adapters'):
-        try:
-            transformer.disable_adapters()
-            print("No active LoRAs - disabled all adapters")
-        except Exception as e:
-            print(f"Error disabling adapters: {e}")
+        # Ensure all adapters are enabled
+        if hasattr(transformer, 'enable_adapters'):
+            try:
+                transformer.enable_adapters()
+                print("Worker: Enabled all LoRA adapters")
+            except Exception as e:
+                print(f"Worker: Error enabling adapters: {e}")
+    else:
+        # No LoRAs to apply, disable adapters if possible
+        if hasattr(transformer, 'disable_adapters'):
+            try:
+                transformer.disable_adapters()
+                print("Worker: No active LoRAs - disabled all adapters")
+            except Exception as e:
+                print(f"Worker: Error disabling adapters: {e}")
 
     total_latent_sections =0 
     frames_per_section_calc =latent_window_size *4 
@@ -1476,7 +1472,7 @@ save_temp_metadata_ui_value: bool = True # New parameter
                          transformer .to (gpu )
                 
                 # Make sure all LoRA modules are also moved to GPU
-                if peft_adapters_to_activate:
+                if active_loras:
                     print("Verifying all LoRA modules are on GPU...")
                     lora_modules_moved = 0
                     for name, module in transformer.named_modules():
@@ -1560,7 +1556,7 @@ save_temp_metadata_ui_value: bool = True # New parameter
 
                 try :
                     # Critical check to ensure all LoRA parameters are on GPU before sampling
-                    if peft_adapters_to_activate:
+                    if active_loras:
                         print("Final device check for all LoRA tensors before sampling...")
                         devices_found = set()
                         lora_params_moved = 0
@@ -1957,7 +1953,9 @@ def manage_lora_structure (selected_lora_dropdown_values):
     for display_name in selected_lora_dropdown_values:
         lora_path = get_lora_path_from_name(display_name)
         if lora_path != "none":
-            adapter_name = os.path.splitext(os.path.basename(lora_path))[0]
+            # Use the same adapter name format as load_lora function
+            filename = os.path.basename(lora_path)
+            adapter_name = str(PurePath(filename).with_suffix('')).replace('.', '_DOT_')
         else:
             adapter_name = None
         target_adapter_names.append(adapter_name)
@@ -3015,7 +3013,7 @@ def get_nearest_bucket_size (width :int ,height :int ,resolution :str )->tuple [
 css =make_progress_bar_css ()
 block =gr .Blocks (css =css ).queue ()
 with block :
-    gr .Markdown ('# FramePack Improved SECourses App V58 - https://www.patreon.com/posts/126855226')
+    gr .Markdown ('# FramePack Improved SECourses App V59 - https://www.patreon.com/posts/126855226')
     with gr .Row ():
 
         model_selector =gr .Radio (
