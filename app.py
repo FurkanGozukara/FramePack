@@ -1,3 +1,17 @@
+def _find_snapshot_dir(repo_id :str ,revision :str ='main')->str :
+    repo_dir =os .path .join (LOCAL_MODELS_DIR ,*repo_id .split ('/'))
+    refs_dir =os .path .join (repo_dir ,'refs')
+    if os .path .isfile (os .path .join (refs_dir ,revision )):
+        with open (os .path .join (refs_dir ,revision ),'r',encoding ='utf-8') as f :
+            commit =f .read ().strip ()
+        snapshot =os .path .join (repo_dir ,'snapshots',commit )
+        if os .path .isdir (snapshot ):
+            return snapshot
+    # Fallback to direct snapshot directory name
+    direct =os .path .join (repo_dir ,revision )
+    if os .path .isdir (direct ):
+        return direct
+    return repo_dir
 from diffusers_helper .hf_login import login 
 
 import os 
@@ -15,7 +29,33 @@ import cv2
 import json 
 from natsort import natsorted 
 
-os .environ ['HF_HOME']=os .path .abspath (os .path .realpath (os .path .join (os .path .dirname (__file__ ),'./hf_download')))
+BASE_DIR =os .path .dirname (os .path .abspath (__file__ ))
+LOCAL_MODELS_DIR =os .path .join (BASE_DIR ,'models')
+
+
+def _local_repo_snapshot_path(repo_id :str ,revision :str ='main')->str :
+    repo_dir =os .path .join (LOCAL_MODELS_DIR ,*repo_id .split ('/'))
+    refs_path =os .path .join (repo_dir ,'refs',revision )
+    if os .path .isfile (refs_path ):
+        with open (refs_path ,'r',encoding ='utf-8') as f :
+            commit =f .read ().strip ()
+        snapshot_dir =os .path .join (repo_dir ,'snapshots',commit )
+    else :
+        snapshot_dir =repo_dir
+
+    if not os .path .isdir (snapshot_dir ):
+        raise FileNotFoundError (f"Required model repo '{repo_id}' (revision '{revision}') not found at {snapshot_dir}.\n"
+                                 f"Please run Download_Models.py to fetch it locally.")
+    return snapshot_dir
+
+
+def _from_pretrained_local(cls ,repo_id :str ,* ,subfolder :str |None =None ,revision :str ='main', **kwargs ):
+    snapshot_path =_find_snapshot_dir (repo_id ,revision =revision )
+    kwargs =dict (kwargs )
+    kwargs .setdefault ('local_files_only',True )
+    if subfolder is not None:
+        kwargs ['subfolder']=subfolder
+    return cls .from_pretrained (snapshot_path ,**kwargs )
 
 import gradio as gr 
 import torch 
@@ -60,22 +100,22 @@ high_vram =False
 print (f'Free VRAM {free_mem_gb} GB')
 print (f'High-VRAM Mode: {high_vram}')
 
-text_encoder =LlamaModel .from_pretrained ("hunyuanvideo-community/HunyuanVideo",subfolder ='text_encoder',torch_dtype =torch .float16 ).cpu ()
-text_encoder_2 =CLIPTextModel .from_pretrained ("hunyuanvideo-community/HunyuanVideo",subfolder ='text_encoder_2',torch_dtype =torch .float16 ).cpu ()
-tokenizer =LlamaTokenizerFast .from_pretrained ("hunyuanvideo-community/HunyuanVideo",subfolder ='tokenizer')
-tokenizer_2 =CLIPTokenizer .from_pretrained ("hunyuanvideo-community/HunyuanVideo",subfolder ='tokenizer_2')
-vae =AutoencoderKLHunyuanVideo .from_pretrained ("hunyuanvideo-community/HunyuanVideo",subfolder ='vae',torch_dtype =torch .float16 ).cpu ()
+text_encoder =_from_pretrained_local (LlamaModel ,"hunyuanvideo-community/HunyuanVideo",subfolder ='text_encoder',torch_dtype =torch .float16 ).cpu ()
+text_encoder_2 =_from_pretrained_local (CLIPTextModel ,"hunyuanvideo-community/HunyuanVideo",subfolder ='text_encoder_2',torch_dtype =torch .float16 ).cpu ()
+tokenizer =_from_pretrained_local (LlamaTokenizerFast ,"hunyuanvideo-community/HunyuanVideo",subfolder ='tokenizer')
+tokenizer_2 =_from_pretrained_local (CLIPTokenizer ,"hunyuanvideo-community/HunyuanVideo",subfolder ='tokenizer_2')
+vae =_from_pretrained_local (AutoencoderKLHunyuanVideo ,"hunyuanvideo-community/HunyuanVideo",subfolder ='vae',torch_dtype =torch .float16 ).cpu ()
 
-feature_extractor =SiglipImageProcessor .from_pretrained ("lllyasviel/flux_redux_bfl",subfolder ='feature_extractor')
-image_encoder =SiglipVisionModel .from_pretrained ("lllyasviel/flux_redux_bfl",subfolder ='image_encoder',torch_dtype =torch .float16 ).cpu ()
+feature_extractor =_from_pretrained_local (SiglipImageProcessor ,"lllyasviel/flux_redux_bfl",subfolder ='feature_extractor')
+image_encoder =_from_pretrained_local (SiglipVisionModel ,"lllyasviel/flux_redux_bfl",subfolder ='image_encoder',torch_dtype =torch .float16 ).cpu ()
 
 print (f"Loading initial transformer model: {DEFAULT_MODEL_NAME}")
 transformer :HunyuanVideoTransformer3DModelPacked 
 if DEFAULT_MODEL_NAME ==MODEL_DISPLAY_NAME_ORIGINAL :
-    transformer =HunyuanVideoTransformer3DModelPacked .from_pretrained (MODEL_NAME_ORIGINAL ,torch_dtype =torch .bfloat16 ).cpu ()
+    transformer =_from_pretrained_local (HunyuanVideoTransformer3DModelPacked ,MODEL_NAME_ORIGINAL ,torch_dtype =torch .bfloat16 ).cpu ()
     active_model_name =MODEL_DISPLAY_NAME_ORIGINAL 
 elif DEFAULT_MODEL_NAME ==MODEL_DISPLAY_NAME_F1 :
-    transformer =HunyuanVideoTransformer3DModelPacked .from_pretrained (MODEL_NAME_F1 ,torch_dtype =torch .bfloat16 ).cpu ()
+    transformer =_from_pretrained_local (HunyuanVideoTransformer3DModelPacked ,MODEL_NAME_F1 ,torch_dtype =torch .bfloat16 ).cpu ()
     active_model_name =MODEL_DISPLAY_NAME_F1 
 else :
     raise ValueError (f"Unknown default model name: {DEFAULT_MODEL_NAME}")
@@ -2103,7 +2143,7 @@ def switch_active_model (target_model_display_name :str ,progress =gr .Progress 
     progress (0.5 ,desc =f"Loading new model '{target_model_display_name}' from {new_model_hf_name}...")
     print (f"Loading new model '{target_model_display_name}' from {new_model_hf_name}...")
     try :
-        transformer =HunyuanVideoTransformer3DModelPacked .from_pretrained (new_model_hf_name ,torch_dtype =torch .bfloat16 ).cpu ()
+        transformer =_from_pretrained_local (HunyuanVideoTransformer3DModelPacked ,new_model_hf_name ,torch_dtype =torch .bfloat16 ).cpu ()
         transformer .eval ()
         transformer .high_quality_fp32_output_for_inference =True 
         transformer .to (dtype =torch .bfloat16 )
@@ -2129,7 +2169,7 @@ def switch_active_model (target_model_display_name :str ,progress =gr .Progress 
         try :
              print ("Attempting to reload default model as fallback...")
              default_hf_name =MODEL_NAME_ORIGINAL if DEFAULT_MODEL_NAME ==MODEL_DISPLAY_NAME_ORIGINAL else MODEL_NAME_F1 
-             transformer =HunyuanVideoTransformer3DModelPacked .from_pretrained (default_hf_name ,torch_dtype =torch .bfloat16 ).cpu ()
+             transformer =_from_pretrained_local (HunyuanVideoTransformer3DModelPacked ,default_hf_name ,torch_dtype =torch .bfloat16 ).cpu ()
              transformer .eval ()
              transformer .high_quality_fp32_output_for_inference =True 
              transformer .to (dtype =torch .bfloat16 )
@@ -3013,7 +3053,7 @@ def get_nearest_bucket_size (width :int ,height :int ,resolution :str )->tuple [
 css =make_progress_bar_css ()
 block =gr .Blocks (css =css ).queue ()
 with block :
-    gr .Markdown ('# FramePack Improved SECourses App v60 - https://www.patreon.com/posts/126855226')
+    gr .Markdown ('# FramePack Improved SECourses App v61 - https://www.patreon.com/posts/126855226')
     with gr .Row ():
 
         model_selector =gr .Radio (
